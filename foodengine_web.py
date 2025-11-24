@@ -970,9 +970,18 @@ def search_engine_block(base_count: int, detailed_count_approx: int) -> str:
         )
         mode = "선택 안 함"
 
+    # 최종 모드 저장
     st.session_state.search_mode = mode
-    return mode
 
+    # 🔸 아직 검색엔진을 고르지 않았으면 왼쪽이랑 똑같은 스타일의 노란 경고 박스
+    if mode == "선택 안 함":
+        st.markdown(
+            "<div style='height: 6px;'></div>",
+            unsafe_allow_html=True,
+        )
+        st.warning("검색 엔진을 선택하세요.")
+
+    return mode
 
 # ============================
 # 음식 + 상태 선택 UI (대표 DB용)
