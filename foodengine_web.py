@@ -556,22 +556,67 @@ def recommend_vector_based_alternatives(
     original_row: pd.Series,
     max_rec: int = 4,
 ) -> pd.DataFrame:
-    """같은 카테고리 우선 → 전체 fallback"""
+    """
+    1순위: 같은 카테고리 + 합격/주의 음식들로 최대 max_rec개 추천
+    2순위: 그 외 카테고리 + 합격/주의 음식들로 나머지 개수 채우기
+    (기존처럼 불합격은 항상 제외)
+    """
     orig_cat = original_row.get(CATEGORY_COL)
 
+    # 결과를 쌓아갈 리스트
+    collected_df_list: list[pd.DataFrame] = []
+
+    # ----- 1단계: 같은 카테고리에서 추천 -----
     if CATEGORY_COL in foods.columns and pd.notna(orig_cat):
         cand_same = foods[foods[CATEGORY_COL] == orig_cat].copy()
-        df_same = _build_vector_recs_from_candidates(
+        same_df = _build_vector_recs_from_candidates(
             cand_same, disease_row, original_row, max_rec
         )
-        if not df_same.empty:
-            return df_same
+        if not same_df.empty:
+            collected_df_list.append(same_df)
 
-    cand_all = foods.copy()
-    df_all = _build_vector_recs_from_candidates(
-        cand_all, disease_row, original_row, max_rec
-    )
-    return df_all
+    # 이미 모인 개수
+    current_n = sum(len(df) for df in collected_df_list)
+
+    # ----- 2단계: 다른 카테고리에서 부족분 채우기 -----
+    if current_n < max_rec:
+        # 같은 카테고리는 제외
+        if CATEGORY_COL in foods.columns and pd.notna(orig_cat):
+            others = foods[foods[CATEGORY_COL] != orig_cat].copy()
+        else:
+            others = foods.copy()
+
+        # 이미 선택된 "기본 음식 이름"은 제외
+        already_names: set[str] = set()
+        for df in collected_df_list:
+            # "추천 음식"이 "이름 / 상태..." 형태라서 앞부분만 이름으로 사용
+            base_names = df["추천 음식"].astype(str).str.split(" /").str[0]
+            already_names.update(base_names.tolist())
+
+        if not others.empty and already_names:
+            others = others[
+                ~others[FOOD_NAME_COL].astype(str).isin(already_names)
+            ]
+
+        remain = max_rec - current_n
+        if remain > 0 and not others.empty:
+            others_df = _build_vector_recs_from_candidates(
+                others, disease_row, original_row, remain
+            )
+            if not others_df.empty:
+                collected_df_list.append(others_df)
+
+    # ----- 최종 합치기 -----
+    if not collected_df_list:
+        return pd.DataFrame()
+
+    result = pd.concat(collected_df_list, ignore_index=True)
+
+    # 혹시 안전하게 max_rec 초과하면 앞에서 max_rec개만 사용
+    if len(result) > max_rec:
+        result = result.iloc[:max_rec].reset_index(drop=True)
+
+    return result
 
 
 # ============================
@@ -685,14 +730,14 @@ def render_history_popover():
         st.caption("최근 10개 기록")
         last10 = hist[-10:][::-1]
         for i, h in enumerate(last10):
-            diseases = h.get("diseases")
-            if diseases is None:
+            diseases_h = h.get("diseases")
+            if diseases_h is None:
                 d = h.get("disease")
-                diseases = [d] if d else []
-            disease_label = ", ".join(diseases) if diseases else "(질병 없음)"
+                diseases_h = [d] if d else []
+            disease_label = ", ".join(diseases_h) if diseases_h else "(질병 없음)"
             label = f"{h['time']} | {disease_label} | {h['food_label']}"
             if st.button(label, key=f"hist_btn_{i}"):
-                st.session_state.final_diseases = diseases
+                st.session_state.final_diseases = diseases_h
                 st.session_state.final_food_row = h["food_row"]
                 st.session_state.page = "result"
                 st.rerun()
@@ -707,27 +752,31 @@ def disease_input_block(disease_names_all: list[str]) -> list[str]:
     selected_list: list[str | None] = []
 
     for i in range(1, 4):
+        key_base = f"disease_{i}"
+        final_key = f"{key_base}_final"
+
+        if "disease_dialog_target" not in st.session_state:
+            st.session_state["disease_dialog_target"] = None
+
+        # 1번은 항상 보이고, 2·3번은 앞 슬롯이 채워졌을 때만 보이게
         if i == 1 or (len(selected_list) >= i - 1 and selected_list[i - 2]):
             st.markdown(f"**질병 {i}**")
-            dcol1, dcol2 = st.columns([5, 2])
-            key_base = f"disease_{i}"
 
-            existing_value = st.session_state.get(f"{key_base}_final")
+            dcol1, dcol2 = st.columns([5, 1.4])
 
-            # 검색
+            existing_value = st.session_state.get(final_key)
+
+            # 1) 왼쪽 검색 박스
             with dcol1:
                 if HAS_SEARCHBOX:
                     disease_selected_search = st_searchbox(
                         lambda p: [
-                            d
-                            for d in disease_names_all
+                            d for d in disease_names_all
                             if p.lower() in str(d).lower()
                         ],
                         key=f"{key_base}_search",
                         default=existing_value,
-                        default_searchterm=str(existing_value)
-                        if existing_value
-                        else "",
+                        default_searchterm=str(existing_value) if existing_value else "",
                         placeholder="Search ...",
                         edit_after_submit="option",
                     )
@@ -736,29 +785,18 @@ def disease_input_block(disease_names_all: list[str]) -> list[str]:
                         "Search ...", f"{key_base}_query", disease_names_all
                     )
 
-                if disease_selected_search:
-                    st.session_state[f"{key_base}_final"] = disease_selected_search
+                if disease_selected_search and disease_selected_search != existing_value:
+                    st.session_state[final_key] = disease_selected_search
                     st.session_state[f"{key_base}_source"] = "search"
+                    st.rerun()
 
-            # SELECT (팝오버)
+            # 2) 오른쪽 SELECT 버튼 → 중앙 팝업
             with dcol2:
-                with st.popover("SELECT"):
-                    st.write("질병 목록에서 선택")
-                    if disease_names_all:
-                        options = ["(선택)"] + disease_names_all
-                        disease_candidate = st.radio(
-                            "질병 목록",
-                            options,
-                            key=f"{key_base}_pop_radio",
-                            index=0,
-                        )
-                        if disease_candidate != "(선택)":
-                            st.session_state[f"{key_base}_final"] = disease_candidate
-                            st.session_state[f"{key_base}_source"] = "select"
-                    else:
-                        st.caption("질병 목록이 없습니다.")
+                if st.button("SELECT", key=f"{key_base}_select_btn"):
+                    st.session_state["disease_dialog_target"] = i
+                    open_disease_select_modal()
 
-            disease_selected = st.session_state.get(f"{key_base}_final")
+            disease_selected = st.session_state.get(final_key)
             selected_list.append(disease_selected)
 
             if not disease_selected and i == 1:
@@ -768,11 +806,22 @@ def disease_input_block(disease_names_all: list[str]) -> list[str]:
 
     final_list = [d for d in selected_list if d]
 
+    # 선택된 질병 표시 박스 (폰트 크게)
     if final_list:
         st.markdown(
-            f"<div style='margin-top:0.5rem; padding:0.5rem; "
-            f"background-color:rgba(180,200,255,0.25); border-radius:8px;'>"
-            f"<b>선택된 질병 :</b> {', '.join(final_list)}</div>",
+            f"""
+            <div style="
+                margin-top:0.7rem;
+                padding:0.6rem 0.8rem;
+                background-color:rgba(180,200,255,0.30);
+                border-radius:8px;
+                font-size:1.15rem;
+                font-weight:600;
+            ">
+                <span style="font-weight:800;">선택된 질병 :</span>
+                {', '.join(final_list)}
+            </div>
+            """,
             unsafe_allow_html=True,
         )
     else:
@@ -783,41 +832,84 @@ def disease_input_block(disease_names_all: list[str]) -> list[str]:
 
 # ============================
 # 검색 엔진 선택 UI (대표 / 구체)
+#  - 대표적인 식품명: 라디오 옵션은 유지, 회색/비활성 처리
+#  - 순서: 선택 안 함, 구체적인 제품명, 대표적인 식품명(비활성)
 # ============================
 def search_engine_block(base_count: int, detailed_count_approx: int) -> str:
     st.subheader("② 검색 엔진 선택")
 
-    # 안내 문구
-    st.markdown(
-        f"<div style='font-size:0.85rem; color:#666; margin-top:0.2rem;'>"
-        f"대표적인 식품명으로 검색: 약 {base_count:,}개의 데이터</div>",
-        unsafe_allow_html=True,
-    )
-    st.markdown(
-        f"<div style='font-size:0.85rem; color:#666; margin-top:0.1rem;'>"
-        f"구체적인 제품명으로 검색: 약 {detailed_count_approx / 10000:.1f}만개의 데이터</div>",
-        unsafe_allow_html=True,
+    opt_none = "선택 안 함"
+    opt_base = f"대표적인 식품명으로 검색: 약 {base_count:,}개"
+    opt_detail = (
+        f"구체적인 제품명으로 검색: 약 {detailed_count_approx / 10000:.1f}만개의 데이터"
     )
 
+    # 보여지는 순서: None → Detail → Base(비활성)
+    options = [opt_none, opt_detail, opt_base]
+
+    # 세션 기본값
     if "search_mode" not in st.session_state:
         st.session_state.search_mode = "선택 안 함"
 
-    options = ["선택 안 함", "대표적인 식품명으로 검색", "구체적인 제품명으로 검색"]
+    # 현재 search_mode를 옵션 문자열로 매핑
+    if st.session_state.search_mode == "구체적인 제품명으로 검색":
+        target = opt_detail
+    elif st.session_state.search_mode == "대표적인 식품명으로 검색":
+        target = opt_base
+    else:
+        target = opt_none
 
     try:
-        idx = options.index(st.session_state.search_mode)
+        idx = options.index(target)
     except ValueError:
         idx = 0
 
-    mode = st.radio(
-        "",
+    # 이 라디오 블록에만 적용되도록 wrapper + CSS
+    st.markdown(
+        """
+        <style>
+        /* 검색 엔진 선택 라디오 안에서만
+           3번째 옵션(대표적인 식품명)을 회색 + 클릭 막기 */
+        .search-engine-radio div[data-testid="stRadio"] div[role="radiogroup"] > label:nth-child(3) span {
+            color: #AAAAAA !important;
+        }
+        .search-engine-radio div[data-testid="stRadio"] div[role="radiogroup"] > label:nth-child(3) {
+            pointer-events: none;      /* 클릭 불가 */
+            opacity: 0.6;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown('<div class="search-engine-radio">', unsafe_allow_html=True)
+    mode_full = st.radio(
+        " ",
         options,
         horizontal=True,
         index=idx,
         label_visibility="collapsed",
+        key="search_mode_radio",
     )
-    st.session_state.search_mode = mode
+    st.markdown("</div>", unsafe_allow_html=True)
 
+    # 내부 로직용 짧은 모드 이름으로 정규화
+    if mode_full == opt_none:
+        mode = "선택 안 함"
+    elif mode_full == opt_base:
+        mode = "대표적인 식품명으로 검색"
+    else:
+        mode = "구체적인 제품명으로 검색"
+
+    # 혹시 CSS가 깨져서 대표적인 식품명이 실제로 선택된 경우 방어
+    if mode == "대표적인 식품명으로 검색":
+        st.info(
+            "대표적인 식품명 검색은 현재 데이터 검토 중이라 사용할 수 없습니다. "
+            "[구체적인 제품명]으로 검색을 이용해주세요."
+        )
+        mode = "선택 안 함"
+
+    st.session_state.search_mode = mode
     return mode
 
 
@@ -855,7 +947,7 @@ def food_input_block_base(
             st.session_state.food_selected_final = food_selected_search
             st.session_state.food_source = "search"
 
-    # 카테고리 SELECT
+    # 카테고리 SELECT (팝오버 안에서 분류 → 음식)
     with fcol2:
         with st.popover("SELECT"):
             st.write("카테고리로 고르기")
@@ -863,35 +955,69 @@ def food_input_block_base(
             if not category_all:
                 st.caption("카테고리 데이터 없음")
             else:
-                cat_options = ["(선택)"] + category_all
-                selected_cat = st.radio(
-                    "카테고리", cat_options, key="cat_pop", index=0
-                )
+                stage_key = "base_select_stage"
+                cat_key = "base_selected_cat"
 
-                foods_in_cat = []
-                if selected_cat != "(선택)":
+                if stage_key not in st.session_state:
+                    st.session_state[stage_key] = "cat"
+                if cat_key not in st.session_state:
+                    st.session_state[cat_key] = None
+
+                stage = st.session_state[stage_key]
+                current_cat = st.session_state[cat_key]
+
+                if stage == "cat":
+                    cat_options = ["(선택)"] + category_all
+                    selected_cat = st.radio(
+                        "카테고리",
+                        cat_options,
+                        key="cat_pop",
+                        index=0,
+                    )
+                    if selected_cat != "(선택)":
+                        st.session_state[cat_key] = selected_cat
+                        st.session_state[stage_key] = "food"
+                        st.rerun()
+                else:
+                    selected_cat = current_cat
+                    st.caption(f"선택된 분류: **{selected_cat}**")
+
+                    if st.button("분류 다시 선택", key="base_cat_reset"):
+                        st.session_state[stage_key] = "cat"
+                        st.session_state[cat_key] = None
+                        st.rerun()
+
                     tmp = foods[foods[CATEGORY_COL] == selected_cat][FOOD_NAME_COL]
                     foods_in_cat = (
                         tmp.dropna().unique().tolist() if not tmp.empty else []
                     )
 
-                if selected_cat == "(선택)":
-                    st.caption("카테고리를 먼저 선택하세요.")
-                elif foods_in_cat:
-                    food_options = ["(선택)"] + foods_in_cat
-                    food_candidate = st.radio(
-                        "음식", food_options, key="food_pop", index=0
-                    )
-                    if food_candidate != "(선택)":
-                        st.session_state.food_selected_final = food_candidate
-                        st.session_state.food_source = "cat"
-                else:
-                    st.caption("해당 카테고리에 음식이 없습니다.")
+                    if not foods_in_cat:
+                        st.caption("해당 카테고리에 음식이 없습니다.")
+                    else:
+                        food_options = ["(선택)"] + foods_in_cat
+                        food_candidate = st.radio(
+                            "음식",
+                            food_options,
+                            key="food_pop",
+                            index=0,
+                        )
+                        if food_candidate != "(선택)":
+                            st.session_state.food_selected_final = food_candidate
+                            st.session_state.food_source = "cat"
+                            st.success("음식이 선택되었습니다. 창을 닫아주세요.")
 
     food_selected = st.session_state.get("food_selected_final")
 
+    # 선택된 음식 표시
     if food_selected:
-        st.info(f"현재 선택된 음식: **{food_selected}**")
+        st.markdown(
+            f"<div style='margin-top:0.5rem; padding:0.55rem 0.7rem; "
+            f"background-color:rgba(255,255,255,0.85); border-radius:8px; "
+            f"border-left:4px solid #4a90e2; font-size:1.05rem; font-weight:600;'>"
+            f"<span style='font-weight:700;'>선택된 음식 :</span> {food_selected}</div>",
+            unsafe_allow_html=True,
+        )
     else:
         st.warning("검색 또는 SELECT에서 음식을 선택하세요.")
 
@@ -1017,7 +1143,7 @@ def food_input_block_detail(
 
     fcol1, fcol2 = st.columns([6, 1])
 
-    # --- 1) 제품 검색 (자동완성: DataFrame 필터) ---
+    # 1) 제품 검색 (자동완성: DataFrame 필터)
     with fcol1:
         existing_food = st.session_state.get("food_selected_final")
 
@@ -1069,53 +1195,31 @@ def food_input_block_detail(
                             food_selected_search = name
                             break
 
-        if food_selected_search and st.session_state.get("food_source") != "cat_detail":
+        if food_selected_search:
             st.session_state.food_selected_final = food_selected_search
             st.session_state.food_source = "search_detail"
 
-    # --- 2) 카테고리 SELECT ---
+    # 2) 카테고리 / 제품 SELECT → 중앙 모달
     with fcol2:
-        with st.popover("SELECT"):
-            st.write("카테고리로 고르기")
+        if st.button("SELECT", key="detail_select_btn"):
+            st.session_state["_detail_foods_df"] = foods
+            open_detail_select_modal()
 
-            if not category_all:
-                st.caption("카테고리 데이터 없음")
-            else:
-                cat_options = ["(선택)"] + category_all
-                selected_cat = st.radio(
-                    "κα테고리", cat_options, key="cat_pop_detail", index=0
-                )
-
-                foods_in_cat = []
-                if selected_cat != "(선택)":
-                    tmp = foods[foods[CATEGORY_COL] == selected_cat][FOOD_NAME_COL]
-                    foods_in_cat = (
-                        tmp.dropna().drop_duplicates().tolist()
-                        if not tmp.empty
-                        else []
-                    )
-
-                if selected_cat == "(선택)":
-                    st.caption("카테고리를 먼저 선택하세요.")
-                elif foods_in_cat:
-                    food_options = ["(선택)"] + foods_in_cat
-                    food_candidate = st.radio(
-                        "제품", food_options, key="food_pop_detail", index=0
-                    )
-                    if food_candidate != "(선택)":
-                        st.session_state.food_selected_final = food_candidate
-                        st.session_state.food_source = "cat_detail"
-                else:
-                    st.caption("해당 카테고리에 제품이 없습니다.")
-
+    # 3) 선택된 제품 표시
     food_selected = st.session_state.get("food_selected_final")
 
     if food_selected:
-        st.info(f"현재 선택된 제품: **{food_selected}**")
+        st.markdown(
+            f"<div style='margin-top:0.5rem; padding=0.55rem 0.7rem; "
+            f"background-color:rgba(255,255,255,0.9); border-radius:8px; "
+            f"border-left:4px solid #4a90e2; font-size:1.05rem; font-weight:600;'>"
+            f"<span style='font-weight:700;'>선택된 음식 :</span> {food_selected}</div>",
+            unsafe_allow_html=True,
+        )
     else:
         st.warning("검색 또는 SELECT에서 제품을 선택하세요.")
 
-    # --- 3) 최종 row 선택 (동명이인 처리) ---
+    # 4) 최종 row 선택 (동명이인 처리)
     selected_row = None
     if food_selected:
         subset = foods[foods[FOOD_NAME_COL] == food_selected].copy()
@@ -1130,10 +1234,11 @@ def food_input_block_detail(
                 options = []
                 for i, (_, r) in enumerate(subset_reset.iterrows()):
                     cat = r.get(CATEGORY_COL)
-                    label = f"{i+1}. {r.get(FOOD_NAME_COL, '')}"
+                    label = f"{i + 1}. {r.get(FOOD_NAME_COL, '')}"
                     if pd.notna(cat):
                         label += f" ({cat})"
                     options.append(label)
+
                 chosen = st.radio(
                     "같은 제품명이 여러 개 있습니다. 선택하세요.",
                     options,
@@ -1184,6 +1289,44 @@ def open_contact_modal():
             st.rerun()
 
 
+@st.dialog("질병 선택")
+def open_disease_select_modal():
+    i = st.session_state.get("disease_dialog_target", 1)
+    disease_names_all = st.session_state.get("_disease_names_all", [])
+
+    key_base = f"disease_{i}"
+    final_key = f"{key_base}_final"
+
+    existing_value = st.session_state.get(final_key)
+
+    if disease_names_all:
+        options = ["(선택)"] + disease_names_all
+
+        if existing_value and existing_value in disease_names_all:
+            default_idx = disease_names_all.index(existing_value) + 1
+        else:
+            default_idx = 0
+
+        choice = st.radio(
+            "질병 선택",
+            options,
+            index=default_idx,
+            key=f"disease_modal_radio_{i}",
+        )
+
+        if choice != "(선택)" and choice != existing_value:
+            st.session_state[final_key] = choice
+            st.session_state[f"{key_base}_source"] = "select"
+            st.session_state["disease_dialog_target"] = None
+            st.rerun()
+    else:
+        st.caption("질병 목록이 없습니다.")
+
+    if st.button("닫기", key="disease_modal_close"):
+        st.session_state["disease_dialog_target"] = None
+        st.rerun()
+
+
 # ============================
 # 사이트 정보 (st.dialog 사용)
 # ============================
@@ -1207,50 +1350,123 @@ def open_site_info_modal():
 # ============================
 @st.dialog("벡터 기반 대체 음식 추천")
 def open_vector_modal():
-    # 모달이 열릴 때 플래그를 바로 내려서 자동 재오픈 방지
-    st.session_state.show_vector_modal = False
+    # 1) 어떤 음식 / 어떤 질병 기준으로 추천할지 세션에서 꺼내오기
+    food_row_dict = st.session_state.get("_current_food_row")
+    disease_results = st.session_state.get("_current_disease_results", [])
 
-    dr_list = st.session_state.get("_current_disease_results", [])
-    frow_dict = st.session_state.get("_current_food_row")
-    if not dr_list or frow_dict is None:
-        st.info("현재 판정 정보가 없어 벡터 기반 추천을 표시할 수 없습니다.")
+    if not food_row_dict or not disease_results:
+        st.info("⚠ 판정 결과가 없어 대체 음식 추천을 할 수 없습니다.")
         return
 
-    frow = pd.Series(frow_dict)
+    # 음식 row
+    frow = pd.Series(food_row_dict)
 
-    # 불합격 질병 우선, 그다음 주의, 없으면 첫 번째
+    # '불합격' 또는 '주의'인 질병을 우선으로 하나 선택
     target_item = None
-    for it in dr_list:
-        if it["res"]["has_fail"]:
-            target_item = it
+    for item in disease_results:
+        r = item["res"]
+        if r["has_fail"] or r["has_warning"]:
+            target_item = item
             break
     if target_item is None:
-        for it in dr_list:
-            if it["res"]["has_warning"]:
-                target_item = it
-                break
-    if target_item is None:
-        target_item = dr_list[0]
+        # 전부 합격이면 첫 번째 질병 기준으로
+        target_item = disease_results[0]
 
     dname = target_item["name"]
     drow = target_item["row"]
 
     st.markdown(f"**기준 질병:** {dname}")
-    st.caption("엑셀 영양소 벡터를 이용해 기존 로직으로 추천한 대체 음식입니다.")
 
+    # 2) 음식 DB 결정 (food_insert1 / food_insert2)
+    mode = st.session_state.get("search_mode") or st.session_state.get("final_search_mode")
+
+    if mode == "구체적인 제품명으로 검색":
+        foods_df = st.session_state.get("_detail_foods_df")
+        if foods_df is None:
+            try:
+                foods_df = load_detail_food()
+                st.session_state["_detail_foods_df"] = foods_df
+            except Exception:
+                foods_df = None
+    else:
+        foods_df = st.session_state.get("_base_foods_df")
+
+    if foods_df is None or foods_df.empty:
+        st.info("⚠ 대체 음식 추천을 위한 음식 데이터가 없습니다.")
+        return
+
+    # 3) 벡터 기반 추천 실행
     vec_df = recommend_vector_based_alternatives(
-        foods=st.session_state["_base_foods_df"],  # 대표 음식 DB 기준으로 추천
+        foods=foods_df,
         disease_row=drow,
         original_row=frow,
         max_rec=4,
     )
 
     if vec_df.empty:
-        st.info("벡터 기반으로 추천할 수 있는 음식이 없습니다.")
+        st.info("⚠ 벡터 기반으로 추천할 수 있는 음식이 없습니다.")
     else:
         st.dataframe(vec_df, use_container_width=True, hide_index=True)
 
     if st.button("닫기", key="vector_close"):
+        st.rerun()
+
+
+
+@st.dialog("제품 선택")
+def open_detail_select_modal():
+    foods = st.session_state.get("_detail_foods_df")
+
+    chosen_food = None
+
+    if foods is None or foods.empty:
+        st.info("제품 데이터를 불러올 수 없습니다.")
+        if st.button("닫기", key="detail_modal_close_empty"):
+            st.rerun()
+        return
+
+    if CATEGORY_COL in foods.columns:
+        category_all = (
+            sorted(foods[CATEGORY_COL].dropna().unique().tolist())
+            if not foods.empty
+            else []
+        )
+    else:
+        category_all = []
+
+    selected_cat = st.selectbox(
+        "카테고리",
+        ["(선택)"] + category_all,
+        key="detail_modal_cat",
+    )
+
+    foods_in_cat = []
+    if selected_cat != "(선택)":
+        tmp = foods[foods[CATEGORY_COL] == selected_cat][FOOD_NAME_COL]
+        foods_in_cat = (
+            tmp.dropna().drop_duplicates().tolist()
+            if not tmp.empty
+            else []
+        )
+
+    if selected_cat == "(선택)" or not foods_in_cat:
+        st.caption("카테고리를 선택하면 해당 제품 목록이 표시됩니다.")
+    else:
+        food_options = ["(선택)"] + foods_in_cat
+        chosen_food = st.radio(
+            "제품 선택",
+            food_options,
+            key="detail_modal_food",
+        )
+        if chosen_food == "(선택)":
+            chosen_food = None
+
+    if chosen_food:
+        st.session_state.food_selected_final = chosen_food
+        st.session_state.food_source = "cat_detail"
+        st.rerun()
+
+    if st.button("닫기", key="detail_modal_close"):
         st.rerun()
 
 
@@ -1265,6 +1481,9 @@ if "final_diseases" not in st.session_state:
 
 if "final_food_row" not in st.session_state:
     st.session_state.final_food_row = None
+
+if "final_search_mode" not in st.session_state:
+    st.session_state.final_search_mode = "선택 안 함"
 
 for i in range(1, 4):
     key_final = f"disease_{i}_final"
@@ -1297,6 +1516,9 @@ if "show_vector_modal" not in st.session_state:
 if "search_mode" not in st.session_state:
     st.session_state.search_mode = "선택 안 함"
 
+if "_detail_foods_df" not in st.session_state:
+    st.session_state["_detail_foods_df"] = None
+
 # 문의 폼 초기화 플래그
 if st.session_state.contact_clear_form:
     st.session_state.contact_email = ""
@@ -1313,7 +1535,6 @@ except Exception as e:
     st.error(f"엑셀 불러오기 실패: {e}")
     st.stop()
 
-# 벡터 추천에서 사용할 대표 음식 DB 저장
 st.session_state["_base_foods_df"] = foods_base
 
 disease_names_all = (
@@ -1321,6 +1542,7 @@ disease_names_all = (
     if DISEASE_NAME_COL in diseases.columns
     else []
 )
+st.session_state["_disease_names_all"] = disease_names_all
 
 food_names_base = (
     foods_base[FOOD_NAME_COL].dropna().unique().tolist()
@@ -1364,10 +1586,8 @@ if st.session_state.page == "input":
         selected_diseases = disease_input_block(disease_names_all)
 
     with col2:
-        # ② 검색 엔진 선택
         current_mode = search_engine_block(base_food_count, DETAIL_FOOD_COUNT_APPROX)
 
-        # ③ 음식 / 제품 선택
         if current_mode == "선택 안 함":
             food_selected, food_row_dict = None, None
         elif current_mode == "대표적인 식품명으로 검색":
@@ -1375,8 +1595,8 @@ if st.session_state.page == "input":
                 foods_base, food_names_base, category_base
             )
         else:  # 구체적인 제품명으로 검색
-            # 이 시점에서만 실제로 food_insert2.xlsx 로드 (지연 로딩)
             foods_detail = load_detail_food()
+            st.session_state["_detail_foods_df"] = foods_detail
             food_selected, food_row_dict = food_input_block_detail(foods_detail)
 
     st.markdown("---")
@@ -1392,6 +1612,7 @@ if st.session_state.page == "input":
         else:
             st.session_state.final_diseases = [str(d) for d in selected_diseases]
             st.session_state.final_food_row = food_row_dict
+            st.session_state.final_search_mode = st.session_state.search_mode
 
             time_str = datetime.now().strftime("%Y-%m-%d %H:%M")
             frow = pd.Series(food_row_dict)
@@ -1424,7 +1645,6 @@ if st.session_state.page == "input":
 
     st.markdown("---")
 
-    # 문의하기 / 사이트 정보 버튼
     left_block, _ = st.columns([0.14, 0.86])
     with left_block:
         b1, b2 = st.columns([1, 1])
@@ -1439,7 +1659,6 @@ if st.session_state.page == "input":
 # PAGE 2 — 결과 화면
 # ============================
 else:
-    # 결과 페이지에서 text_input 스타일 박스 전부 숨기기 (흰색 긴 박스 제거)
     st.markdown(
         """
         <style>
@@ -1473,7 +1692,6 @@ else:
 
     frow = pd.Series(frow_dict)
 
-    # 아이콘용 타입
     food_name_for_icon = str(frow.get(FOOD_NAME_COL, ""))
     food_cat_for_icon = frow.get(CATEGORY_COL, None)
     base_type_for_icon = infer_base_type(food_name_for_icon, food_cat_for_icon)
@@ -1486,7 +1704,6 @@ else:
     }
     ai_food_icon = icon_map.get(base_type_for_icon, "🍽️")
 
-    # ===== LOADING 스피너 =====
     with st.spinner("LOADING..."):
         disease_results = []
         for dname in dnames:
@@ -1521,7 +1738,6 @@ else:
 
         sorted_results = sorted(disease_results, key=sort_key)
 
-        # AI가 참고할 질병 목록 (불합격/주의만)
         ai_target_diseases = [
             d["name"]
             for d in disease_results
@@ -1532,11 +1748,9 @@ else:
         if ai_target_diseases and HAS_OPENAI and client is not None:
             ai_text = get_ai_alternatives(frow, ai_target_diseases)
 
-    # 벡터 모달에서 쓸 것 세션 저장
     st.session_state["_current_disease_results"] = disease_results
     st.session_state["_current_food_row"] = frow_dict
 
-    # 상단 메트릭
     c1, c2, c3 = st.columns(3)
     with c1:
         st.metric("질병", ", ".join(d["name"] for d in disease_results))
@@ -1561,9 +1775,7 @@ else:
 
     st.markdown("---")
 
-    # ============================
-    # AI 대체 음식 추천
-    # ============================
+    # ===== AI 대체 음식 추천 =====
     if ai_target_diseases:
         if not ai_text:
             st.info(
@@ -1647,7 +1859,6 @@ else:
                     border=0,
                 )
 
-                # 제목(왼쪽) + 버튼(오른쪽)
                 header_left, header_right = st.columns([8.7, 1.3])
                 with header_left:
                     st.markdown(
@@ -1693,13 +1904,10 @@ else:
                     unsafe_allow_html=True,
                 )
 
-    # 벡터 기반 모달 열기
     if st.session_state.show_vector_modal:
         open_vector_modal()
 
-    # ============================
-    # 질병별 상세 표
-    # ============================
+    # ===== 질병별 상세 표 =====
     def style_by_status(row):
         status = row.get("판정")
         if status == "불합격":
@@ -1729,7 +1937,6 @@ else:
 
         st.markdown(f"### {dname} — {status_text}")
 
-        # 질병 설명
         disease_explain_text = None
         if (
             isinstance(disease_expl, pd.DataFrame)
